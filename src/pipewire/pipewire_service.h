@@ -317,7 +317,14 @@ private:
   std::string m_defaultSourceName;
   AudioState m_state;
   PrivacyState m_privacyState;
+  // Direct V4L2 camera users, sorted. Only users that held a device for the hold time are listed.
   std::vector<std::string> m_cameraApps;
+  struct PendingCameraApp {
+    std::string app;
+    std::chrono::steady_clock::time_point firstSeen;
+  };
+  // Users seen by a scan but not yet held long enough to be reported.
+  std::vector<PendingCameraApp> m_cameraPending;
   V4l2CameraWatch m_cameraWatch;
   std::future<std::vector<std::string>> m_cameraScan;
   // Next scan start or completion check; empty while idle so the camera never wakes the loop.

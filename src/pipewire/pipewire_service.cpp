@@ -63,6 +63,9 @@ namespace {
   // list the new descriptor yet when IN_OPEN arrives, so scans run once the burst has settled.
   constexpr auto kCameraScanDelay = std::chrono::milliseconds(500);
   constexpr auto kCameraScanCheckInterval = std::chrono::milliseconds(50);
+  // Applications such as Discord briefly open every camera to query its capabilities. A direct
+  // V4L2 user is reported only once it has held the device this long, so probes never show.
+  constexpr auto kCameraHoldTime = std::chrono::seconds(3);
 
   // Milliseconds until deadline, rounded up and clamped to [0, INT_MAX].
   [[nodiscard]] int
@@ -1062,9 +1065,13 @@ void PipeWireService::dispatchCamera() {
 void PipeWireService::requestCameraScan(std::chrono::steady_clock::time_point now) {
   if (m_cameraScan.valid()) {
     m_cameraRescan = true;
-  } else if (!m_cameraScanAt.has_value()) {
-    // Keep an existing deadline so a continuous event stream cannot postpone the scan forever.
-    m_cameraScanAt = now + kCameraScanDelay;
+    return;
+  }
+  // Never postpone an existing deadline, so a continuous event stream cannot delay the scan
+  // forever, but pull a later hold confirmation forward so a quick close is not missed.
+  const auto deadline = now + kCameraScanDelay;
+  if (!m_cameraScanAt.has_value() || deadline < *m_cameraScanAt) {
+    m_cameraScanAt = deadline;
   }
 }
 
@@ -1097,8 +1104,29 @@ void PipeWireService::pollCameraApps() {
   }
   try {
     auto apps = m_cameraScan.get();
-    if (apps != m_cameraApps) {
-      m_cameraApps = std::move(apps);
+    std::vector<std::string> confirmed;
+    std::vector<PendingCameraApp> pending;
+    for (auto& app : apps) {
+      if (std::ranges::binary_search(m_cameraApps, app)) {
+        confirmed.push_back(std::move(app));
+        continue;
+      }
+      // Pending users missing from this scan are dropped, so a reopen starts a new hold.
+      const auto it = std::ranges::find(m_cameraPending, app, &PendingCameraApp::app);
+      const auto firstSeen = it != m_cameraPending.end() ? it->firstSeen : now;
+      if (now - firstSeen >= kCameraHoldTime) {
+        confirmed.push_back(std::move(app));
+      } else {
+        const auto confirmAt = firstSeen + kCameraHoldTime;
+        if (!m_cameraScanAt.has_value() || confirmAt < *m_cameraScanAt) {
+          m_cameraScanAt = confirmAt;
+        }
+        pending.push_back({.app = std::move(app), .firstSeen = firstSeen});
+      }
+    }
+    m_cameraPending = std::move(pending);
+    if (confirmed != m_cameraApps) {
+      m_cameraApps = std::move(confirmed);
       rebuildState();
     }
   } catch (const std::exception& e) {
